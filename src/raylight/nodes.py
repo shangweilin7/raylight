@@ -504,15 +504,23 @@ class RayInitializer:
         effective_ring_degree = ring_degree
 
         selected_gpus = _parse_gpu_select(GPU_SELECT)
+        is_remote_cluster = ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES
         if selected_gpus is None:
-            max_world_size = torch.cuda.device_count()
+            if is_remote_cluster:
+                # Remote cluster: the ComfyUI driver host may see fewer local GPUs
+                # than the cluster exposes. Do NOT cap world_size by driver-local
+                # torch.cuda.device_count(); validate against the cluster's GPU
+                # resources after ray.init connects instead.
+                max_world_size = None
+            else:
+                max_world_size = torch.cuda.device_count()
         else:
             visible_gpu_count = torch.cuda.device_count()
             invalid = [gpu_idx for gpu_idx in selected_gpus if gpu_idx >= visible_gpu_count]
             if invalid:
                 raise ValueError(f"GPU_SELECT contains GPU index outside visible range 0-{visible_gpu_count - 1}: {invalid}")
             max_world_size = len(selected_gpus)
-        if world_size > max_world_size:
+        if max_world_size is not None and world_size > max_world_size:
             raise ValueError(f"Too many gpus: requested {world_size} but only {max_world_size} selected/visible")
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
@@ -609,21 +617,36 @@ class RayInitializer:
             if restricted_cuda_visible_devices is not None:
                 os.environ["CUDA_VISIBLE_DEVICES"] = restricted_cuda_visible_devices
             try:
-                ray.init(
-                    ray_cluster_address,
-                    namespace=ray_cluster_namespace,
-                    runtime_env=deepcopy(runtime_env_base),
-                    object_store_memory=ray_object_store_gb,
-                    include_dashboard=enable_dashboard,
-                    dashboard_host=dashboard_host,
-                    dashboard_port=dashboard_port,
-                )
+                # Joining an EXISTING remote cluster: Ray rejects local-creation
+                # kwargs (object_store_memory / dashboard_*) for a pre-existing
+                # cluster, so only pass them for a local cluster we create here.
+                init_kwargs = {
+                    "namespace": ray_cluster_namespace,
+                    "runtime_env": deepcopy(runtime_env_base),
+                }
+                if not is_remote_cluster:
+                    init_kwargs.update(
+                        object_store_memory=ray_object_store_gb,
+                        include_dashboard=enable_dashboard,
+                        dashboard_host=dashboard_host,
+                        dashboard_port=dashboard_port,
+                    )
+                ray.init(ray_cluster_address, **init_kwargs)
             finally:
                 if restricted_cuda_visible_devices is not None:
                     if original_cuda_visible_devices is not None:
                         os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
                     else:
                         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+            # After connecting to a remote cluster: validate world_size against the
+            # cluster's actual GPU resources (the driver host may see fewer local GPUs).
+            if is_remote_cluster:
+                cluster_gpus = int(ray.cluster_resources().get("GPU", 0))
+                if world_size > cluster_gpus:
+                    raise ValueError(
+                        f"Too many gpus: requested {world_size} but remote cluster only has {cluster_gpus} GPU"
+                    )
         except Exception as e:
             ray.shutdown()
             _cleanup_ray_temp()
