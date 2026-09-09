@@ -616,6 +616,32 @@ class RayInitializer:
             master_host = ray_cluster_address.rsplit(":", 1)[0]
         runtime_env_base.setdefault("env_vars", {})["MASTER_ADDR"] = master_host
         runtime_env_base.setdefault("env_vars", {})["MASTER_PORT"] = str(master_port)
+        # Cross-node NCCL data path: without NCCL_SOCKET_IFNAME, NCCL auto-picks
+        # an interface (often tailscale0/LAN/veth) that is unreachable across
+        # hosts, hanging every rank in init_process_group at ~99% CPU with no
+        # GPU util. This value is only a bootstrap default/fallback: the real
+        # per-host pinning happens inside each Ray actor
+        # (_resolve_local_nccl_ifname in distributed_worker/ray_worker.py),
+        # because the two Spark hosts name the two ends of the same RoCE cable
+        # differently (head: enp1s0f0np0, worker: enP2p1s0f0np0) and no single
+        # broadcast value can be correct on both. The actor overwrites
+        # NCCL_SOCKET_IFNAME with its own interconnect NIC before
+        # init_process_group, so keep this default harmless either way.
+        _nccl_if = os.environ.get("RAYLIGHT_NCCL_IFNAME",
+                                  "enp1s0f0np0,enP2p1s0f0np0")
+        if _nccl_if:
+            runtime_env_base.setdefault("env_vars", {})["NCCL_SOCKET_IFNAME"] = _nccl_if
+            runtime_env_base.setdefault("env_vars", {})["NCCL_DEBUG"] = "INFO"
+        # GB10 (Grace Blackwell) multi-node NCCL: published Blackwell guidance
+        # (GDR level 5) actively breaks init on GB10; level 0 is what works.
+        # Two Spark hosts interconnect over ConnectX-7 RoCE (adept case-sensitive
+        # capital P in the worker's NIC name). Watchdog default fires early under
+        # unified-memory pressure, so lengthen the heartbeat timeout.
+        env_vars = runtime_env_base.setdefault("env_vars", {})
+        env_vars.setdefault("NCCL_NET_GDR_LEVEL", "0")
+        env_vars.setdefault("NCCL_IB_HCA",
+                            "rocep1s0f0:1,roceP2p1s0f0:1")
+        env_vars.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "1800")
 
         if ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES:
             _configure_raylight_ray_tmpdir(runtime_env_base)

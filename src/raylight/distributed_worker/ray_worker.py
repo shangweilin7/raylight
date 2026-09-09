@@ -373,8 +373,45 @@ def _build_ray_guider(model, guider_spec):
     return guider
 
 
+def _resolve_local_nccl_ifname():
+    """Pin NCCL to THIS node's interconnect NIC.
+
+    The head (jarvis) and worker (jarvis2) name the two ends of the same RoCE
+    cable differently (head: enp1s0f0np0, worker: enP2p1s0f0np0), so a single
+    broadcast value (runtime_env env_vars) can never be correct on both hosts.
+    Each Ray actor runs ON a specific node, so resolve the local interface
+    whose IPv4 shares MASTER_ADDR's /24 - that is always the interconnect NIC
+    here (192.168.100.x). Returns None when it cannot be resolved, in which
+    case callers keep whatever NCCL_SOCKET_IFNAME was already set.
+    """
+    master = os.environ.get("MASTER_ADDR", "")
+    if not master or "." not in master:
+        return None
+    prefix = ".".join(master.split(".")[:-1]) + "."
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        # e.g. "2: enp1s0f0np0    inet 192.168.100.1/24 brd ..."
+        if len(parts) >= 4 and parts[2] == "inet":
+            ifname = parts[1].rstrip(":")
+            ip = parts[3].split("/")[0]
+            if ip.startswith(prefix):
+                return ifname
+    return None
+
+
 class RayWorker:
     def __init__(self, local_rank, device_id, parallel_dict):
+        local_if = _resolve_local_nccl_ifname()
+        if local_if:
+            os.environ["NCCL_SOCKET_IFNAME"] = local_if
         worker_cli_args = _apply_worker_comfy_cli_args_from_env()
         self.model = None
         self.vae_model = None
@@ -1414,6 +1451,10 @@ class RayCOMMTester:
     def __init__(self, local_rank, world_size, device_id):
         device = torch.device(f"cuda:{device_id}")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+        # Pin NCCL to this node's interconnect NIC (per-host).
+        local_if = _resolve_local_nccl_ifname()
+        if local_if:
+            os.environ["NCCL_SOCKET_IFNAME"] = local_if
 
         dist.init_process_group(
             "nccl",
