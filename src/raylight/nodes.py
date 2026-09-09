@@ -604,6 +604,19 @@ class RayInitializer:
 
         _inject_worker_cli_args(runtime_env_base)
 
+        # Worker-side NCCL rendezvous env. torch.distributed's env:// handler
+        # reads MASTER_ADDR/MASTER_PORT from the ACTOR process env. Remote Ray
+        # actors are separate processes that never inherit the ComfyUI driver's
+        # os.environ mutations, so the master address must travel inside
+        # runtime_env.env_vars to reach them. For a remote cluster a loopback
+        # master is invalid (each worker would rendezvous with itself), so fall
+        # back to the Ray head node's host from ray_cluster_address.
+        master_host, master_port = torch_host, torch_port
+        if is_remote_cluster and master_host in ("127.0.0.1", "localhost", "::1"):
+            master_host = ray_cluster_address.rsplit(":", 1)[0]
+        runtime_env_base.setdefault("env_vars", {})["MASTER_ADDR"] = master_host
+        runtime_env_base.setdefault("env_vars", {})["MASTER_PORT"] = str(master_port)
+
         if ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES:
             _configure_raylight_ray_tmpdir(runtime_env_base)
 
