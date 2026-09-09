@@ -639,6 +639,11 @@ class RayInitializer:
         # unified-memory pressure, so lengthen the heartbeat timeout.
         env_vars = runtime_env_base.setdefault("env_vars", {})
         env_vars.setdefault("NCCL_NET_GDR_LEVEL", "0")
+        # GB10 multi-node: the two Spark hosts' RoCE/IB data path is broken
+        # (ibv_modify_qp fails with "Invalid argument" on rocep1s0f0), verified
+        # on both ends. Force the TCP socket transport (NCCL_IB_DISABLE=1),
+        # which all_reduce was end-to-end verified with across both hosts.
+        env_vars.setdefault("NCCL_IB_DISABLE", "1")
         env_vars.setdefault("NCCL_IB_HCA",
                             "rocep1s0f0:1,roceP2p1s0f0:1")
         env_vars.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "1800")
