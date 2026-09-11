@@ -13,6 +13,9 @@
 #
 # 用法：
 #   ./restart_raylight_cluster.sh            # 完整重啟（清 6380 進程 → 起 head → 起 peer → 驗證）
+#   ./restart_raylight_cluster.sh --ensure   # 確保模式（給 comfyui.service ExecStartPre 用）：
+#                                            #   已健康(>=2 顆 Alive GPU node)就跳過不重建；
+#                                            #   不健康才完整重建；peer 暫不可達也不擋（exit 0）。
 #   ./restart_raylight_cluster.sh --start-only  # 只啟動，若 cluster 已在跑則直接驗證/離開
 #   ./restart_raylight_cluster.sh --help
 #
@@ -34,8 +37,9 @@ MY_USER=$(id -un)
 
 MODE=full
 case "${1:-}" in
+  --ensure)     MODE=ensure ;;
   --start-only) MODE=start-only ;;
-  --help|-h)    sed -n '1,30p' "$0"; exit 0 ;;
+  --help|-h)    sed -n '1,34p' "$0"; exit 0 ;;
   --)           :
 esac
 
@@ -112,14 +116,43 @@ verify() {
   echo "預期：2 nodes / 2 GPU 且 vLLM(6379) 未動。若有 3 nodes / 3 GPU → 對端仍有 stale raylet，請重跑一次清理，或手動 kill 多出來那顆。"
 }
 
+# ---- 4.5) 健康檢查（--ensure 用）------------------------------------------------------------
+# 回傳 Alive 且帶 GPU 的 node 數；cluster 連不上回 0
+cluster_healthy() {
+  local h
+  h=$( "$COMFYUI_DIR/venv/bin/python" - "$HEAD_IP:$RAYLIGHT_PORT" <<'PY' 2>/dev/null || echo 0
+import sys
+try:
+    import ray
+    ray.init(address=sys.argv[1], ignore_reinit_error=True, namespace="default", log_to_driver=False)
+    nodes = ray.nodes()
+    alive_gpu = [n for n in nodes if n.get("Alive") and n.get("Resources", {}).get("GPU", 0) > 0]
+    print(len(alive_gpu))
+except Exception:
+    print(0)
+PY
+)
+  echo "${h:-0}"
+}
+
 # ---- main ---------------------------------------------------------------------------
+if [[ "$MODE" == "ensure" ]]; then
+  h=$(cluster_healthy)
+  if [[ "${h:-0}" -ge 2 ]]; then
+    echo "== [ensure] cluster 已健康（${h} 顆 Alive GPU node）→ 跳過重建 =="
+    exit 0
+  fi
+  echo "== [ensure] cluster 不健康（${h:-0}/2 顆 GPU node）→ 執行完整重建 =="
+  MODE=full
+fi
+
 if [[ "$MODE" == "full" ]]; then
   kill_raylight head  0
   kill_raylight peer  1
 fi
 
 start_head
-start_peer
+start_peer || true   # peer 暫不可達時不擋 ComfyUI 啟動（--ensure / start-only 皆然）
 verify
 
 echo ""
