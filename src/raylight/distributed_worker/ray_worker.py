@@ -412,6 +412,13 @@ class RayWorker:
         local_if = _resolve_local_nccl_ifname()
         if local_if:
             os.environ["NCCL_SOCKET_IFNAME"] = local_if
+            # xfuser's GroupCoordinator builds a cross-rank gloo cpu_group
+            # (torch.distributed.new_group(..., backend="gloo")) over TCP.
+            # Without GLOO_SOCKET_IFNAME gloo auto-picks the loopback on each
+            # actor, so every rank rendezvous with itself and connectFullMesh
+            # dies with "Connection refused ... remote=[127.0.0.1]". Pin it to
+            # the same interconnect NIC as NCCL.
+            os.environ["GLOO_SOCKET_IFNAME"] = local_if
         worker_cli_args = _apply_worker_comfy_cli_args_from_env()
         self.model = None
         self.vae_model = None
@@ -1455,6 +1462,13 @@ class RayCOMMTester:
         local_if = _resolve_local_nccl_ifname()
         if local_if:
             os.environ["NCCL_SOCKET_IFNAME"] = local_if
+            # xfuser's GroupCoordinator builds a cross-rank gloo cpu_group
+            # (torch.distributed.new_group(..., backend="gloo")) over TCP.
+            # Without GLOO_SOCKET_IFNAME gloo auto-picks the loopback on each
+            # actor, so every rank rendezvous with itself and connectFullMesh
+            # dies with "Connection refused ... remote=[127.0.0.1]". Pin it to
+            # the same interconnect NIC as NCCL.
+            os.environ["GLOO_SOCKET_IFNAME"] = local_if
 
         dist.init_process_group(
             "nccl",
@@ -1514,9 +1528,42 @@ def make_ray_actor_fn(world_size, parallel_dict):
 
         if num_replicas <= 1 or not use_group_process_group:
             # XDiT DP stays in one global group; xFuser derives DP ranks internally.
+            # Pin rank 0 (the master that opens the TCPStore on MASTER_ADDR:MASTER_PORT)
+            # to the driver's node (= Ray head), so the master rank always lands on the
+            # host MASTER_ADDR points to.  Without this, Ray may place RayWorker:0 on a
+            # worker node (e.g. when the head GPU slot is co-resident with another
+            # workload), and every rank then times out connecting to (headIP, port).
+            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+            head_node_id = ray.get_runtime_context().get_node_id()
+            # Rank 0 (the TCPStore master) must land on the head host that
+            # MASTER_ADDR points to.  Non-zero ranks must land on a *different*
+            # node: with only one GPU per host, leaving rank1+ on the default
+            # strategy packs every worker onto the head node, where they
+            # serialize on the single GPU and dist.init_process_group can never
+            # reach world_size ("1/2 clients joined" -> 60s TCPStore timeout).
+            # Pin non-zero ranks to the first other node that reports a GPU.
+            peer_node_id = next(
+                (
+                    n["NodeID"]
+                    for n in ray.nodes()
+                    if n["NodeID"] != head_node_id
+                    and n.get("Alive")
+                    and n["Resources"].get("GPU", 0) > 0
+                ),
+                None,
+            )
             for local_rank in range(world_size):
+                _opts = dict(num_gpus=1, name=f"RayWorker:{local_rank}")
+                if local_rank == 0:
+                    _opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                        node_id=head_node_id, soft=False
+                    )
+                elif peer_node_id is not None:
+                    _opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                        node_id=peer_node_id, soft=False
+                    )
                 gpu_actors.append(
-                    gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
+                    gpu_actor.options(**_opts).remote(
                         local_rank=local_rank,
                         device_id=0,
                         parallel_dict=parallel_dict,

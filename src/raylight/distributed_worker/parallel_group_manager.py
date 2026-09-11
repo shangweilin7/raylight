@@ -130,12 +130,13 @@ def initialize_xfuser_parallel(local_rank: int, world_size: int, parallel_dict: 
     )
 
     rank_generator = RankGenerator(
-        1,
-        config.sequence_parallel_degree,
-        config.pp_degree,
-        config.cfg_degree,
-        config.data_parallel_degree,
-        "tp-sp-pp-cfg-dp",
+        tp=1,
+        sp=config.sequence_parallel_degree,
+        pp=config.pp_degree,
+        cfg=config.cfg_degree,
+        dp=config.data_parallel_degree,
+        fs=1,
+        order="tp-sp-pp-cfg-dp",
     )
     return XFuserParallelContext(
         config=config,

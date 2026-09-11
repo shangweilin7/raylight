@@ -181,7 +181,11 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
 
     video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
     audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
-    v, a = self.final_layer(h, t_emb, video_seg, audio_seg)
+    # mirror comfy/ldm/minimax/model.py:_forward — FinalLayer now needs sigma/sample_sigmas/shifts
+    shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))
+    shift_a = float(transformer_options.get("minimax_h3_sigma_shift_audio", self.sigma_shift_audio))
+    sigma_v = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
+    v, a = self.final_layer(h, t_emb, video_seg, audio_seg, sigma_v, transformer_options.get("sample_sigmas"), (shift_v, shift_a))
 
     video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
     video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
